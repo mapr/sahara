@@ -16,7 +16,6 @@
 import logging
 import telnetlib
 import time
-import uuid
 
 import fixtures
 from keystoneclient.v2_0 import client as keystone_client
@@ -30,6 +29,7 @@ import six
 from swiftclient import client as swift_client
 from testtools import testcase
 
+from sahara.openstack.common import uuidutils
 from sahara.tests.integration.configs import config as cfg
 import sahara.utils.openstack.images as imgs
 from sahara.utils import ssh_remote
@@ -74,14 +74,62 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
     def setUp(self):
         super(ITestCase, self).setUp()
         self.common_config = cfg.ITConfig().common_config
-        self.vanilla_config = cfg.ITConfig().vanilla_config
-        self.vanilla_two_config = cfg.ITConfig().vanilla_two_config
-        self.hdp_config = cfg.ITConfig().hdp_config
+        self.plugin_config = self.get_plugin_config()
+        self._setup_clients()
+        self._setup_networks()
+        self._setup_volume_params()
+        self._setup_flavor()
+        self._setup_ssh_access()
+
+        self._image_id, self._ssh_username = (
+            self.get_image_id_and_ssh_username())
 
         telnetlib.Telnet(
             self.common_config.SAHARA_HOST, self.common_config.SAHARA_PORT
         )
 
+    def get_plugin_config(self):
+        raise NotImplementedError
+
+    def _setup_ssh_access(self):
+        if not self.common_config.PATH_TO_SSH_KEY:
+            self.user_keypair_id = self.rand_name(
+                self.common_config.USER_KEYPAIR_ID)
+            self.private_key = self.nova.keypairs.create(
+                self.user_keypair_id).private_key
+
+        else:
+            self.user_keypair_id = self.common_config.USER_KEYPAIR_ID
+            self.private_key = open(self.common_config.PATH_TO_SSH_KEY).read()
+
+    def _setup_flavor(self):
+        if not self.common_config.FLAVOR_ID:
+            self.flavor_id = self.nova.flavors.create(
+                name=self.rand_name('i-test-flavor'),
+                ram=1024,
+                vcpus=1,
+                disk=10,
+                ephemeral=10).id
+
+        else:
+            self.flavor_id = self.common_config.FLAVOR_ID
+
+    def _setup_networks(self):
+        self.floating_ip_pool = self.common_config.FLOATING_IP_POOL
+        self.internal_neutron_net = None
+        if self.common_config.NEUTRON_ENABLED:
+            self.internal_neutron_net = self.get_internal_neutron_net_id()
+            self.floating_ip_pool = (
+                self.get_floating_ip_pool_id_for_neutron_net())
+
+    def _setup_volume_params(self):
+        self.volumes_per_node = 0
+        self.volumes_size = 0
+        if not getattr(self.plugin_config, 'SKIP_CINDER_TEST', False):
+            self.volumes_per_node = 2
+            self.volumes_size = 2
+
+    def _setup_clients(self):
         keystone = keystone_client.Client(
             username=self.common_config.OS_USERNAME,
             password=self.common_config.OS_PASSWORD,
@@ -90,9 +138,8 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
 
         keystone.management_url = self.common_config.OS_AUTH_URL
 
-        self.common_config.OS_TENANT_ID = [
-            tenant.id for tenant in keystone.tenants.list()
-            if tenant.name == self.common_config.OS_TENANT_NAME][0]
+        tenant_id = [tenant.id for tenant in keystone.tenants.list()
+                     if tenant.name == self.common_config.OS_TENANT_NAME][0]
 
         self.sahara = sahara_client.Client(
             version=self.common_config.SAHARA_API_VERSION,
@@ -104,7 +151,7 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
                 self.common_config.SAHARA_HOST,
                 self.common_config.SAHARA_PORT,
                 self.common_config.SAHARA_API_VERSION,
-                self.common_config.OS_TENANT_ID
+                tenant_id
             ))
 
         self.nova = nova_client.Client(
@@ -119,35 +166,16 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
             tenant_name=self.common_config.OS_TENANT_NAME,
             auth_url=self.common_config.OS_AUTH_URL)
 
-        if not self.common_config.FLAVOR_ID:
-            self.flavor_id = self.nova.flavors.create(
-                name='i-test-flavor-%s' % str(uuid.uuid4())[:8],
-                ram=1024,
-                vcpus=1,
-                disk=10,
-                ephemeral=10).id
-
-        else:
-            self.flavor_id = self.common_config.FLAVOR_ID
-
-        if not self.common_config.PATH_TO_SSH_KEY:
-            self.common_config.USER_KEYPAIR_ID += str(uuid.uuid4())[:8]
-            self.private_key = self.nova.keypairs.create(
-                self.common_config.USER_KEYPAIR_ID).private_key
-
-        else:
-            self.private_key = open(self.common_config.PATH_TO_SSH_KEY).read()
-
 # ------------------------Methods for object creation--------------------------
 
     def create_node_group_template(self, name, plugin_config, description,
                                    node_processes, node_configs,
-                                   volumes_per_node=0, volume_size=0,
-                                   floating_ip_pool=None):
+                                   volumes_per_node=0, volumes_size=0,
+                                   floating_ip_pool=None, **kwargs):
         data = self.sahara.node_group_templates.create(
             name, plugin_config.PLUGIN_NAME, plugin_config.HADOOP_VERSION,
-            self.flavor_id, description, volumes_per_node, volume_size,
-            node_processes, node_configs, floating_ip_pool)
+            self.flavor_id, description, volumes_per_node, volumes_size,
+            node_processes, node_configs, floating_ip_pool, **kwargs)
         node_group_template_id = data.id
         return node_group_template_id
 
@@ -172,11 +200,11 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
 
         data = self.sahara.clusters.create(
             name, plugin_config.PLUGIN_NAME, plugin_config.HADOOP_VERSION,
-            cluster_template_id, plugin_config.IMAGE_ID, is_transient,
+            cluster_template_id, self._image_id, is_transient,
             description, cluster_configs, node_groups,
-            self.common_config.USER_KEYPAIR_ID, anti_affinity, net_id)
+            self.user_keypair_id, anti_affinity, net_id)
         self.cluster_id = data.id
-        self.poll_cluster_state(self.cluster_id)
+        return self.cluster_id
 
     def get_cluster_info(self, plugin_config):
         node_ip_list_with_node_processes = (
@@ -264,6 +292,16 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
         # }
         return node_ip_list_with_node_processes
 
+    def put_file_to_hdfs(self, namenode_ip, remote_path, data):
+        tmp_file_path = '/tmp/%s' % uuidutils.generate_uuid()[:8]
+        self.open_ssh_connection(namenode_ip)
+        self.write_file_to(tmp_file_path, data)
+        self.execute_command(
+            'sudo su - -c "hadoop dfs -copyFromLocal %s %s" %s' % (
+                tmp_file_path, remote_path, self.plugin_config.HADOOP_USER))
+        self.execute_command('rm -fr %s' % tmp_file_path)
+        self.close_ssh_connection()
+
     def try_telnet(self, host, port):
         try:
             telnetlib.Telnet(host, port)
@@ -323,8 +361,7 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
         }
 
     def await_active_workers_for_namenode(self, node_info, plugin_config):
-        self.open_ssh_connection(
-            node_info['namenode_ip'], plugin_config.SSH_USERNAME)
+        self.open_ssh_connection(node_info['namenode_ip'])
         timeout = self.common_config.HDFS_INITIALIZATION_TIMEOUT * 60
         try:
             with fixtures.Timeout(timeout, gentle=True):
@@ -366,6 +403,24 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
         finally:
             self.close_ssh_connection()
 
+    def await_active_tasktracker(self, node_info, plugin_config):
+        self.open_ssh_connection(node_info['namenode_ip'])
+        for i in range(self.common_config.HDFS_INITIALIZATION_TIMEOUT * 6):
+            time.sleep(10)
+            active_tasktracker_count = self.execute_command(
+                'sudo -u %s bash -lc "hadoop job -list-active-trackers" '
+                '| grep "^tracker_" | wc -l'
+                % plugin_config.HADOOP_USER)[1]
+            active_tasktracker_count = int(active_tasktracker_count)
+            if (active_tasktracker_count == node_info['tasktracker_count']):
+                break
+        else:
+            self.fail(
+                'Tasktracker or datanode cannot be started within '
+                '%s minute(s) for namenode.'
+                % self.common_config.HDFS_INITIALIZATION_TIMEOUT)
+        self.close_ssh_connection()
+
 # --------------------------------Remote---------------------------------------
 
     def connect_to_swift(self):
@@ -377,8 +432,8 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
             auth_version=self.common_config.SWIFT_AUTH_VERSION
         )
 
-    def open_ssh_connection(self, host, ssh_username):
-        ssh_remote._connect(host, ssh_username, self.private_key)
+    def open_ssh_connection(self, host):
+        ssh_remote._connect(host, self._ssh_username, self.private_key)
 
     @staticmethod
     def execute_command(cmd):
@@ -414,16 +469,16 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
                 )
         self.execute_command('chmod 777 script.sh')
 
-    def transfer_helper_script_to_nodes(self, node_ip_list, ssh_username,
-                                        script_name, parameter_list=None):
+    def transfer_helper_script_to_nodes(self, node_ip_list, script_name,
+                                        parameter_list=None):
         for node_ip in node_ip_list:
-            self.open_ssh_connection(node_ip, ssh_username)
+            self.open_ssh_connection(node_ip)
             self.transfer_helper_script_to_node(script_name, parameter_list)
             self.close_ssh_connection()
 
 # -------------------------------Helper methods--------------------------------
 
-    def get_image_id_and_ssh_username(self, plugin_config):
+    def get_image_id_and_ssh_username(self):
         def print_error_log(parameter, value):
             print(
                 '\nImage with %s "%s" was found in image list but it was '
@@ -442,45 +497,42 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
         images = self.nova.images.list()
         # If plugin_config.IMAGE_ID is not None then find corresponding image
         # and return its ID and username. If image not found then handle error
-        if plugin_config.IMAGE_ID:
+        if self.plugin_config.IMAGE_ID:
             for image in images:
-                if image.id == plugin_config.IMAGE_ID:
+                if image.id == self.plugin_config.IMAGE_ID:
                     return try_get_image_id_and_ssh_username(
-                        'ID', plugin_config.IMAGE_ID
-                    )
+                        'ID', self.plugin_config.IMAGE_ID)
             self.fail(
                 '\n\nImage with ID "%s" not found in image list. Please, make '
-                'sure you specified right image ID.\n' % plugin_config.IMAGE_ID
-            )
+                'sure you specified right image ID.\n' %
+                self.plugin_config.IMAGE_ID)
         # If plugin_config.IMAGE_NAME is not None then find corresponding image
         # and return its ID and username. If image not found then handle error
-        if plugin_config.IMAGE_NAME:
+        if self.plugin_config.IMAGE_NAME:
             for image in images:
-                if image.name == plugin_config.IMAGE_NAME:
+                if image.name == self.plugin_config.IMAGE_NAME:
                     return try_get_image_id_and_ssh_username(
-                        'name', plugin_config.IMAGE_NAME
-                    )
+                        'name', self.plugin_config.IMAGE_NAME)
             self.fail(
                 '\n\nImage with name "%s" not found in image list. Please, '
                 'make sure you specified right image name.\n'
-                % plugin_config.IMAGE_NAME
-            )
+                % self.plugin_config.IMAGE_NAME)
         # If plugin_config.IMAGE_TAG is not None then find corresponding image
         # and return its ID and username. If image not found then handle error
-        if plugin_config.IMAGE_TAG:
+        if self.plugin_config.IMAGE_TAG:
             for image in images:
                 if (image.metadata.get(imgs.PROP_TAG + '%s'
-                    % plugin_config.IMAGE_TAG)) and (
-                        image.metadata.get(imgs.PROP_TAG + (
-                                           '%s' % plugin_config.PLUGIN_NAME))):
+                    % self.plugin_config.IMAGE_TAG)) and (
+                        image.metadata.get(imgs.PROP_TAG + str(
+                                           self.plugin_config.PLUGIN_NAME))):
                     return try_get_image_id_and_ssh_username(
-                        'tag', plugin_config.IMAGE_TAG
+                        'tag', self.plugin_config.IMAGE_TAG
                     )
             self.fail(
                 '\n\nImage with tag "%s" not found in list of registered '
                 'images for Sahara. Please, make sure tag "%s" was added to '
                 'image and image was correctly registered.\n'
-                % (plugin_config.IMAGE_TAG, plugin_config.IMAGE_TAG)
+                % (self.plugin_config.IMAGE_TAG, self.plugin_config.IMAGE_TAG)
             )
         # If plugin_config.IMAGE_ID, plugin_config.IMAGE_NAME and
         # plugin_config.IMAGE_TAG are None then image is chosen
@@ -491,8 +543,8 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
         # If image with tag "sahara_i_tests" not found then handle error
         for image in images:
             if (image.metadata.get(imgs.PROP_TAG + 'sahara_i_tests')) and (
-                    image.metadata.get(imgs.PROP_TAG + (
-                                       '%s' % plugin_config.PLUGIN_NAME))):
+                    image.metadata.get(imgs.PROP_TAG + str(
+                                       self.plugin_config.PLUGIN_NAME))):
                 try:
                     return image.id, image.metadata[imgs.PROP_USERNAME]
 
@@ -557,7 +609,11 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
                        node_group_template_id_list=None):
         if not self.common_config.RETAIN_CLUSTER_AFTER_TEST:
             if cluster_id:
-                self.sahara.clusters.delete(cluster_id)
+                try:
+                    self.sahara.clusters.delete(cluster_id)
+                except client_base.APIException:
+                    # cluster in deleting state or deleted
+                    pass
 
                 try:
                     # waiting roughly for 300 seconds for cluster to terminate
@@ -617,9 +673,13 @@ class ITestCase(testcase.WithAttributes, base.BaseTestCase):
             '!*!\n\n'
         )
 
+    @staticmethod
+    def rand_name(name):
+        return '%s-%s' % (name, uuidutils.generate_uuid()[:8])
+
     def tearDown(self):
         if not self.common_config.PATH_TO_SSH_KEY:
-            self.nova.keypairs.delete(self.common_config.USER_KEYPAIR_ID)
+            self.nova.keypairs.delete(self.user_keypair_id)
         if not self.common_config.FLAVOR_ID:
             self.nova.flavors.delete(self.flavor_id)
 

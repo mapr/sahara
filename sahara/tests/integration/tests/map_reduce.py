@@ -19,6 +19,8 @@ from sahara.tests.integration.tests import base
 
 
 class MapReduceTest(base.ITestCase):
+    DEFAULT_TEST_SCRIPT = 'map_reduce_test_script.sh'
+
     def _run_pi_job(self):
         self.execute_command('./script.sh run_pi_job')
 
@@ -48,20 +50,24 @@ class MapReduceTest(base.ITestCase):
                     '/tmp/MapReduceTestOutput/log.txt'
                 )
 
-    def _transfer_helper_script_to_nodes(self, cluster_info):
+    def _transfer_helper_script_to_nodes(self, cluster_info, script=None):
+        script = script or MapReduceTest.DEFAULT_TEST_SCRIPT
         data = self.sahara.clusters.get(cluster_info['cluster_id'])
         node_groups = data.node_groups
         for node_group in node_groups:
             if node_group['volumes_per_node'] != 0:
                 self._add_params_to_script_and_transfer_to_node(
-                    cluster_info, node_group, node_with_volumes=True)
+                    cluster_info, node_group, node_with_volumes=True,
+                    script=script)
             else:
                 self._add_params_to_script_and_transfer_to_node(
-                    cluster_info, node_group)
+                    cluster_info, node_group, script=script)
 
     def _add_params_to_script_and_transfer_to_node(self, cluster_info,
                                                    node_group,
-                                                   node_with_volumes=False):
+                                                   node_with_volumes=False,
+                                                   script=None):
+        script = script or MapReduceTest.DEFAULT_TEST_SCRIPT
         plugin_config = cluster_info['plugin_config']
         hadoop_log_directory = plugin_config.HADOOP_LOG_DIRECTORY
         if node_with_volumes:
@@ -75,10 +81,9 @@ class MapReduceTest(base.ITestCase):
         }
         for instance in node_group['instances']:
             try:
-                self.open_ssh_connection(
-                    instance['management_ip'], plugin_config.SSH_USERNAME)
+                self.open_ssh_connection(instance['management_ip'])
                 self.transfer_helper_script_to_node(
-                    'map_reduce_test_script.sh', extra_script_parameters
+                    script, extra_script_parameters
                 )
                 self.close_ssh_connection()
 
@@ -88,11 +93,12 @@ class MapReduceTest(base.ITestCase):
 
     @base.skip_test('SKIP_MAP_REDUCE_TEST',
                     message='Test for Map Reduce was skipped.')
-    def map_reduce_testing(self, cluster_info, check_log=True):
-        self._transfer_helper_script_to_nodes(cluster_info)
+    def map_reduce_testing(self, cluster_info, check_log=True, script=None):
+        script = script or MapReduceTest.DEFAULT_TEST_SCRIPT
+        self._transfer_helper_script_to_nodes(cluster_info, script)
         plugin_config = cluster_info['plugin_config']
         namenode_ip = cluster_info['node_info']['namenode_ip']
-        self.open_ssh_connection(namenode_ip, plugin_config.SSH_USERNAME)
+        self.open_ssh_connection(namenode_ip)
         self._run_pi_job()
         job_name = self._get_name_of_completed_pi_job()
         self.close_ssh_connection()
@@ -106,9 +112,7 @@ class MapReduceTest(base.ITestCase):
             have_logs = False
             for node_ip, process_list in node_ip_and_process_list.items():
                 if plugin_config.PROCESS_NAMES['tt'] in process_list:
-                    self.open_ssh_connection(
-                        node_ip, plugin_config.SSH_USERNAME
-                    )
+                    self.open_ssh_connection(node_ip)
                     try:
                         self.execute_command(
                             './script.sh check_directory -job_name %s' %
@@ -120,8 +124,7 @@ class MapReduceTest(base.ITestCase):
                         self.close_ssh_connection()
 
             if not have_logs:
-                self.open_ssh_connection(namenode_ip,
-                                         plugin_config.SSH_USERNAME)
+                self.open_ssh_connection(namenode_ip)
                 try:
                     self.capture_error_log_from_cluster_node(
                         '/tmp/MapReduceTestOutput/log.txt')
@@ -131,6 +134,6 @@ class MapReduceTest(base.ITestCase):
                 self.fail("Log file of completed 'PI' job on 'tasktracker' or "
                           "'nodemanager' cluster node not found.")
 
-        self.open_ssh_connection(namenode_ip, plugin_config.SSH_USERNAME)
+        self.open_ssh_connection(namenode_ip)
         self._run_wordcount_job()
         self.close_ssh_connection()
